@@ -3,9 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 import os
 import shutil
-import sqlite3
+import psycopg2
 
-app = FastAPI(title="SaaS Control de Reparaciones - API Local")
+app = FastAPI(title="SaaS Control de Reparaciones - API en la Nube")
 
 app.add_middleware(
     CORSMiddleware,
@@ -15,18 +15,22 @@ app.add_middleware(
     allow_headers=["*"],  # Permite todos los encabezados
 )
 
-DATABASE_FILE = "taller.db"
+# Cadena de conexión oficial a tu Supabase
+DB_URI = "postgresql://postgres:Buuren2708@db.sohavacqphahseoezale.supabase.co:5432/postgres"
 CARPETA_UPLOADS = "uploads"
 
 if not os.path.exists(CARPETA_UPLOADS):
     os.makedirs(CARPETA_UPLOADS)
 
+def obtener_conexion():
+    return psycopg2.connect(DB_URI)
+
 def inicializar_base_de_datos():
-    conexion = sqlite3.connect(DATABASE_FILE)
+    conexion = obtener_conexion()
     cursor = conexion.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS equipos_reparacion (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             tenant_id INTEGER NOT NULL,
             cliente_nombre TEXT NOT NULL,
             cliente_telefono TEXT NOT NULL,
@@ -36,7 +40,7 @@ def inicializar_base_de_datos():
             accesorios TEXT,
             falla_reportada TEXT NOT NULL,
             costo_estimado REAL DEFAULT 0.0,
-            costo_final REAL DEFAULT 0.0, -- <-- NUEVA COLUMNA
+            costo_final REAL DEFAULT 0.0,
             ruta_foto_local TEXT,
             estado TEXT DEFAULT 'recibido',
             tecnico_receptor TEXT, 
@@ -44,37 +48,67 @@ def inicializar_base_de_datos():
         )
     """)
     
-    # Migración automática para bases de datos existentes
+    # Intento de migración limpia para PostgreSQL
     try:
         cursor.execute("ALTER TABLE equipos_reparacion ADD COLUMN costo_final REAL DEFAULT 0.0")
-    except sqlite3.OperationalError:
-        pass
+    except Exception:
+        conexion.rollback() # Si la columna ya existe, cancelamos el error limpiamente
+    else:
+        conexion.commit()
 
     conexion.commit()
     conexion.close()
 
+def inicializar_inventario():
+    conexion = obtener_conexion()
+    cursor = conexion.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS inventario (
+            id SERIAL PRIMARY KEY,
+            tenant_id INTEGER DEFAULT 1,
+            nombre TEXT NOT NULL,
+            categoria TEXT NOT NULL,
+            stock INTEGER DEFAULT 0,
+            precio_costo REAL DEFAULT 0.0,
+            precio_venta REAL DEFAULT 0.0,
+            estado_fisico TEXT DEFAULT 'Buen Estado',
+            observaciones TEXT DEFAULT ''             
+        )
+    """)
+    conexion.commit()
+    conexion.close()
+
+# Inicializamos ambas estructuras en Supabase
 inicializar_base_de_datos()
+inicializar_inventario()
 
 @app.get("/api/equipos")
 def obtener_equipos(tenant_id: int = 1):
     try:
-        conexion = sqlite3.connect(DATABASE_FILE)
-        conexion.row_factory = sqlite3.Row
+        conexion = obtener_conexion()
         cursor = conexion.cursor()
         
-        # Aseguramos que 'cliente_telefono' esté en la consulta
         cursor.execute("""
             SELECT id, cliente_nombre, cliente_telefono, tipo_equipo, 
                    marca_modelo, numero_serie, accesorios, falla_reportada, 
                    costo_estimado, costo_final, ruta_foto_local, estado, tecnico_receptor, fecha_ingreso 
             FROM equipos_reparacion 
-            WHERE tenant_id = ? 
+            WHERE tenant_id = %s 
             ORDER BY id DESC
         """, (tenant_id,))
         
         filas = cursor.fetchall()
+        
+        # Mapeo manual de columnas ya que PostgreSQL no cuenta con row_factory de forma nativa
+        columnas = [
+            "id", "cliente_nombre", "cliente_telefono", "tipo_equipo", 
+            "marca_modelo", "numero_serie", "accesorios", "falla_reportada", 
+            "costo_estimado", "costo_final", "ruta_foto_local", "estado", "tecnico_receptor", "fecha_ingreso"
+        ]
+        
+        equipos = [dict(zip(columnas, fila)) for fila in filas]
         conexion.close()
-        return {"success": True, "equipos": [dict(fila) for fila in filas]}
+        return {"success": True, "equipos": equipos}
     except Exception as e:
         return {"success": False, "mensaje": f"Error: {str(e)}"}
 
@@ -99,29 +133,28 @@ async def registrar_equipo(
             shutil.copyfileobj(foto.file, buffer)
 
     try:
-        conexion = sqlite3.connect(DATABASE_FILE)
+        conexion = obtener_conexion()
         cursor = conexion.cursor()
         
         query = """
             INSERT INTO equipos_reparacion 
             (tenant_id, cliente_nombre, cliente_telefono, tipo_equipo, marca_modelo, numero_serie, accesorios, falla_reportada, costo_estimado, costo_final, ruta_foto_local, tecnico_receptor)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
         """
         
         cursor.execute(query, (
             tenant_id, cliente_nombre, cliente_telefono, tipo_equipo, 
             marca_modelo, numero_serie, accesorios, falla_reportada, 
-            costo_estimado, costo_estimado, ruta_foto_guardada, tecnico_receptor # Por defecto el costo final inicia igual al estimado
+            costo_estimado, costo_estimado, ruta_foto_guardada, tecnico_receptor
         ))
         
-        id_generado = cursor.lastrowid
+        id_generado = cursor.fetchone()[0]
         conexion.commit()
         conexion.close()
         return {"success": True, "mensaje": f"Orden #{id_generado} creada."}
     except Exception as e:
         return {"success": False, "mensaje": f"Error: {str(e)}"}
 
-# MODIFICADO: Ahora acepta el costo_final de forma opcional
 @app.post("/api/equipos/actualizar-estado")
 def actualizar_estado(
     id: int = Form(...), 
@@ -129,20 +162,20 @@ def actualizar_estado(
     costo_final: Optional[float] = Form(None)
 ):
     try:
-        conexion = sqlite3.connect(DATABASE_FILE)
+        conexion = obtener_conexion()
         cursor = conexion.cursor()
         
         if nuevo_estado == 'terminado' and costo_final is not None:
             cursor.execute("""
                 UPDATE equipos_reparacion 
-                SET estado = ?, costo_final = ? 
-                WHERE id = ?
+                SET estado = %s, costo_final = %s 
+                WHERE id = %s
             """, (nuevo_estado, costo_final, id))
         else:
             cursor.execute("""
                 UPDATE equipos_reparacion 
-                SET estado = ? 
-                WHERE id = ?
+                SET estado = %s 
+                WHERE id = %s
             """, (nuevo_estado, id))
             
         conexion.commit()
@@ -150,24 +183,23 @@ def actualizar_estado(
         return {"success": True, "mensaje": "Orden actualizada correctamente."}
     except Exception as e:
         return {"success": False, "mensaje": f"Error: {str(e)}"}
-  # 5. ENDPOINT ACTUALIZADO: EDITAR DATOS GENERALES Y ACCESORIOS
+
 @app.post("/api/equipos/editar-orden")
 def editar_orden(
     id: int = Form(...),
     cliente_nombre: str = Form(...),
     marca_modelo: str = Form(...),
     falla_reportada: str = Form(...),
-    accesorios: str = Form(...)  # <--- Agregamos accesorios
+    accesorios: str = Form(...)
 ):
     try:
-        conexion = sqlite3.connect(DATABASE_FILE)
+        conexion = obtener_conexion()
         cursor = conexion.cursor()
         
-        # Agregamos accesorios al UPDATE
         cursor.execute("""
             UPDATE equipos_reparacion 
-            SET cliente_nombre = ?, marca_modelo = ?, falla_reportada = ?, accesorios = ?
-            WHERE id = ?
+            SET cliente_nombre = %s, marca_modelo = %s, falla_reportada = %s, accesorios = %s
+            WHERE id = %s
         """, (cliente_nombre, marca_modelo, falla_reportada, accesorios, id))
         
         conexion.commit()
@@ -175,58 +207,31 @@ def editar_orden(
         return {"success": True, "mensaje": "Orden editada correctamente."}
     except Exception as e:
         return {"success": False, "mensaje": f"Error al editar: {str(e)}"}
-    # 6. ENDPOINT: ELIMINAR ORDEN DE REPARACIÓN
+
 @app.post("/api/equipos/eliminar-orden")
 def eliminar_orden(id: int = Form(...)):
     try:
-        conexion = sqlite3.connect(DATABASE_FILE)
+        conexion = obtener_conexion()
         cursor = conexion.cursor()
         
-        # Verificar si la orden existe antes de borrar
-        cursor.execute("SELECT id FROM equipos_reparacion WHERE id = ?", (id,))
+        cursor.execute("SELECT id FROM equipos_reparacion WHERE id = %s", (id,))
         existe = cursor.fetchone()
         
         if not existe:
             conexion.close()
             return {"success": False, "mensaje": "La orden no existe."}
             
-        # Eliminar registro
-        cursor.execute("DELETE FROM equipos_reparacion WHERE id = ?", (id,))
+        cursor.execute("DELETE FROM equipos_reparacion WHERE id = %s", (id,))
         conexion.commit()
         conexion.close()
         return {"success": True, "mensaje": "Orden eliminada correctamente."}
     except Exception as e:
         return {"success": False, "mensaje": f"Error: {str(e)}"}
-    # =====================================================================
-# MÓDULO DE INVENTARIO Y HERRAMIENTAS - backend
-# =====================================================================
-
-def inicializar_inventario():
-    conexion = sqlite3.connect(DATABASE_FILE)
-    cursor = conexion.cursor()
-    # Añadimos estado_fisico y observaciones para controlar tus herramientas fijas
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS inventario (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tenant_id INTEGER DEFAULT 1,
-            nombre TEXT NOT NULL,
-            categoria TEXT NOT NULL,
-            stock INTEGER DEFAULT 0,
-            precio_costo REAL DEFAULT 0.0,
-            precio_venta REAL DEFAULT 0.0,
-            estado_fisico TEXT DEFAULT 'Buen Estado', -- Nuevo: Para tus herramientas
-            observaciones TEXT DEFAULT ''             -- Nuevo: Notas como "Mesa 1", "Falla cable"
-        )
-    """)
-    conexion.commit()
-    conexion.close()
-
-inicializar_inventario()
 
 @app.get("/api/inventario")
 def obtener_inventario():
     try:
-        conexion = sqlite3.connect(DATABASE_FILE)
+        conexion = obtener_conexion()
         cursor = conexion.cursor()
         cursor.execute("SELECT id, nombre, categoria, stock, precio_costo, precio_venta, estado_fisico, observaciones FROM inventario ORDER BY categoria ASC, nombre ASC")
         productos = cursor.fetchall()
@@ -254,11 +259,11 @@ def agregar_producto(
     observaciones: str = Form("")
 ):
     try:
-        conexion = sqlite3.connect(DATABASE_FILE)
+        conexion = obtener_conexion()
         cursor = conexion.cursor()
         cursor.execute("""
             INSERT INTO inventario (nombre, categoria, stock, precio_costo, precio_venta, estado_fisico, observaciones)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
         """, (nombre, categoria, stock, precio_costo, precio_venta, estado_fisico, observaciones))
         conexion.commit()
         conexion.close()
@@ -269,9 +274,9 @@ def agregar_producto(
 @app.post("/api/inventario/actualizar-stock")
 def actualizar_stock(id: int = Form(...), nuevo_stock: int = Form(...)):
     try:
-        conexion = sqlite3.connect(DATABASE_FILE)
+        conexion = obtener_conexion()
         cursor = conexion.cursor()
-        cursor.execute("UPDATE inventario SET stock = ? WHERE id = ?", (nuevo_stock, id))
+        cursor.execute("UPDATE inventario SET stock = %s WHERE id = %s", (nuevo_stock, id))
         conexion.commit()
         conexion.close()
         return {"success": True, "mensaje": "Cantidad actualizada."}
@@ -281,9 +286,9 @@ def actualizar_stock(id: int = Form(...), nuevo_stock: int = Form(...)):
 @app.post("/api/inventario/eliminar")
 def eliminar_producto(id: int = Form(...)):
     try:
-        conexion = sqlite3.connect(DATABASE_FILE)
+        conexion = obtener_conexion()
         cursor = conexion.cursor()
-        cursor.execute("DELETE FROM inventario WHERE id = ?", (id,))
+        cursor.execute("DELETE FROM inventario WHERE id = %s", (id,))
         conexion.commit()
         conexion.close()
         return {"success": True, "mensaje": "Eliminado correctamente."}
