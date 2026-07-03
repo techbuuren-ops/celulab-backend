@@ -10,7 +10,7 @@ app = FastAPI(title="SaaS Control de Reparaciones - API en la Nube")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Permite que tu Live Server local se conecte sin restricciones
-    allow_credentials=True,
+    allow_credentials=false,
     allow_methods=["*"],  # Permite GET, POST, PUT, DELETE, etc.
     allow_headers=["*"],  # Permite todos los encabezados
 )
