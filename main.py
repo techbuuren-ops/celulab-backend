@@ -16,7 +16,7 @@ app.add_middleware(
 )
 
 # Cadena de conexión oficial a tu Supabase
-DB_URI = "postgresql://postgres.sohavacqphahseoezale:[Buuren2708a]@aws-1-us-west-2.pooler.supabase.com:5432/postgres"
+DB_URI = "postgresql://postgres.sohavacqphahseoezale:[Buuren2708@]@aws-1-us-west-2.pooler.supabase.com:5432/postgres"
 CARPETA_UPLOADS = "uploads"
 
 if not os.path.exists(CARPETA_UPLOADS):
